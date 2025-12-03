@@ -1,302 +1,634 @@
+"""
+EmoGo Backend API
+A FastAPI application for mood tracking with video vlogs.
+"""
+
 import os
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from typing import Optional, List, Dict, Any
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
 from motor.motor_asyncio import AsyncIOMotorClient
-from typing import Optional
 from bson import ObjectId
 from dotenv import load_dotenv
+import logging
 
-# 1. Load Environment Variables
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
 load_dotenv()
 
-app = FastAPI()
-
-# 2. Ensure 'videos' directory exists
-os.makedirs("videos", exist_ok=True)
-
-# 3. Mount Static Files (Crucial for video playback)
-app.mount("/videos", StaticFiles(directory="videos"), name="videos")
-
-# 4. Database Connection
+# Constants
+VIDEOS_DIR = "videos"
 MONGO_URL = os.getenv("MONGODB_URL")
-if not MONGO_URL:
-    print("WARNING: MONGODB_URL is not set!")
+DB_NAME = "emogo_db"
+COLLECTION_NAME = "records"
 
-client = AsyncIOMotorClient(MONGO_URL)
-db = client.emogo_db
-collection = db.records
+# ==================== LIFESPAN CONTEXT ====================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage database connection lifecycle"""
+    # Startup
+    if not MONGO_URL:
+        logger.error("MONGODB_URL environment variable is not set!")
+        raise RuntimeError("MONGODB_URL is required")
+    
+    app.mongodb_client = AsyncIOMotorClient(MONGO_URL)
+    app.database = app.mongodb_client[DB_NAME]
+    app.collection = app.database[COLLECTION_NAME]
+    logger.info("Connected to MongoDB")
+    
+    yield
+    
+    # Shutdown
+    app.mongodb_client.close()
+    logger.info("Closed MongoDB connection")
 
-# 5. Data Model
+# ==================== APP INITIALIZATION ====================
+app = FastAPI(
+    title="EmoGo Backend API",
+    description="Mood tracking with video vlogs and geolocation",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure appropriately for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Ensure videos directory exists and mount static files
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+app.mount(f"/{VIDEOS_DIR}", StaticFiles(directory=VIDEOS_DIR), name="videos")
+
+# ==================== PYDANTIC MODELS ====================
 class EmoRecord(BaseModel):
-    mood: str
-    latitude: float
-    longitude: float
-    timestamp: str
-    vlog_file: Optional[str] = "demo_vlog.mp4"
-    note: Optional[str] = None
+    """Model for emotion record"""
+    mood: str = Field(..., min_length=1, max_length=50, description="User's mood")
+    latitude: float = Field(..., ge=-90, le=90, description="Latitude coordinate")
+    longitude: float = Field(..., ge=-180, le=180, description="Longitude coordinate")
+    timestamp: str = Field(..., description="ISO format timestamp")
+    vlog_file: Optional[str] = Field(default="demo_vlog.mp4", description="Video filename or URL")
+    note: Optional[str] = Field(default=None, max_length=500, description="Optional note")
 
-# ==========================
-#        API ROUTES
-# ==========================
+    @validator('timestamp')
+    def validate_timestamp(cls, v):
+        """Ensure timestamp is not empty"""
+        if not v or not v.strip():
+            raise ValueError("Timestamp cannot be empty")
+        return v.strip()
 
-@app.get("/")
-async def root():
-    return {"message": "EmoGo Backend is Live (Rich Dashboard Version)!"}
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "mood": "happy",
+                "latitude": 40.7128,
+                "longitude": -74.0060,
+                "timestamp": "2025-12-03T10:30:00Z",
+                "vlog_file": "my_vlog.mp4",
+                "note": "Beautiful day in NYC"
+            }
+        }
 
-@app.post("/record", status_code=201)
-async def add_record(record: EmoRecord):
-    result = await collection.insert_one(record.dict())
-    return {"status": "success", "id": str(result.inserted_id)}
+class RecordResponse(BaseModel):
+    """Response model for record operations"""
+    status: str
+    id: Optional[str] = None
+    deleted: Optional[str] = None
+    deleted_count: Optional[int] = None
 
-@app.get("/records")
-async def list_records():
-    # Return raw records as JSON for the interactive dashboard
-    items = []
-    # Sort by newest first
-    async for doc in collection.find().sort("timestamp", -1):
-        # Convert ObjectId to string for JSON serialization
+# ==================== HELPER FUNCTIONS ====================
+def serialize_doc(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert MongoDB document to JSON-serializable dict"""
+    if doc and "_id" in doc:
         doc["_id"] = str(doc["_id"])
-        items.append(doc)
-    return {"records": items}
+    return doc
 
-# ==========================
-#    INTERACTIVE DASHBOARD
-# ==========================
+async def get_collection():
+    """Dependency to get collection"""
+    return app.collection
 
-@app.get("/export", response_class=HTMLResponse)
+# ==================== API ROUTES ====================
+
+@app.get("/", tags=["Health"])
+async def root():
+    """Health check endpoint"""
+    return {
+        "message": "EmoGo Backend is Live!",
+        "version": "2.0.0",
+        "status": "operational"
+    }
+
+@app.post(
+    "/record",
+    status_code=status.HTTP_201_CREATED,
+    response_model=RecordResponse,
+    tags=["Records"]
+)
+async def add_record(record: EmoRecord):
+    """
+    Create a new emotion record with optional video vlog
+    
+    - **mood**: User's current mood
+    - **latitude**: Geolocation latitude
+    - **longitude**: Geolocation longitude
+    - **timestamp**: When the record was created
+    - **vlog_file**: Optional video file name or URL
+    - **note**: Optional text note
+    """
+    try:
+        result = await app.collection.insert_one(record.model_dump())
+        logger.info(f"Created record with ID: {result.inserted_id}")
+        return RecordResponse(status="success", id=str(result.inserted_id))
+    except Exception as e:
+        logger.error(f"Error creating record: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create record"
+        )
+
+@app.get("/records", tags=["Records"])
+async def list_records(
+    limit: int = 100,
+    skip: int = 0,
+    mood: Optional[str] = None
+):
+    """
+    List all emotion records with optional filtering
+    
+    - **limit**: Maximum number of records to return (default: 100)
+    - **skip**: Number of records to skip (default: 0)
+    - **mood**: Filter by specific mood (optional)
+    """
+    try:
+        query = {"mood": mood} if mood else {}
+        cursor = app.collection.find(query).sort("timestamp", -1).skip(skip).limit(limit)
+        
+        items = []
+        async for doc in cursor:
+            items.append(serialize_doc(doc))
+        
+        return {"records": items, "count": len(items)}
+    except Exception as e:
+        logger.error(f"Error fetching records: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch records"
+        )
+
+@app.get("/record/{record_id}", tags=["Records"])
+async def get_record(record_id: str):
+    """Get a single record by ID"""
+    if not ObjectId.is_valid(record_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid record ID format"
+        )
+    
+    doc = await app.collection.find_one({"_id": ObjectId(record_id)})
+    if not doc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Record not found"
+        )
+    
+    return serialize_doc(doc)
+
+@app.delete(
+    "/record/{record_id}",
+    response_model=RecordResponse,
+    tags=["Records"]
+)
+async def delete_record(record_id: str):
+    """Delete a single record by ID"""
+    if not ObjectId.is_valid(record_id):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid record ID format"
+        )
+    
+    result = await app.collection.delete_one({"_id": ObjectId(record_id)})
+    if result.deleted_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Record not found"
+        )
+    
+    logger.info(f"Deleted record: {record_id}")
+    return RecordResponse(status="success", deleted=record_id)
+
+@app.delete(
+    "/records/cleanup",
+    response_model=RecordResponse,
+    tags=["Maintenance"]
+)
+async def cleanup_empty_vlogs():
+    """Remove all records with missing or empty video files"""
+    query = {
+        "$or": [
+            {"vlog_file": {"$exists": False}},
+            {"vlog_file": None},
+            {"vlog_file": ""}
+        ]
+    }
+    
+    result = await app.collection.delete_many(query)
+    logger.info(f"Cleaned up {result.deleted_count} records without videos")
+    return RecordResponse(status="success", deleted_count=result.deleted_count)
+
+# ==================== ADMIN DASHBOARD ====================
+
+@app.get("/export", response_class=HTMLResponse, tags=["Dashboard"])
 async def export_dashboard(request: Request):
-    base = str(request.base_url).rstrip("/")
-
-    # Serve a rich HTML page that fetches data from /records and renders stats + charts
+    """Interactive admin dashboard with statistics and filtering"""
+    base_url = str(request.base_url).rstrip("/")
+    
     html_content = f"""
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
     <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>EmoGo Admin Dashboard</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
             :root {{
-                --bg: #0f172a;
-                --panel: #111827;
-                --text: #e5e7eb;
-                --accent: #60a5fa;
-                --muted: #9ca3af;
-                --green: #22c55e;
-                --red: #ef4444;
+                --bg-primary: #0f172a;
+                --bg-secondary: #1e293b;
+                --bg-card: rgba(30, 41, 59, 0.8);
+                --text-primary: #f1f5f9;
+                --text-secondary: #94a3b8;
+                --accent: #3b82f6;
+                --accent-hover: #2563eb;
+                --success: #10b981;
+                --success-hover: #059669;
+                --danger: #ef4444;
+                --danger-hover: #dc2626;
+                --border: #334155;
             }}
-            * {{ box-sizing: border-box; }}
-            body {{
+            
+            * {{
+                box-sizing: border-box;
                 margin: 0;
-                padding: 24px;
-                background: linear-gradient(180deg, #0b1220, #0f172a 40%, #0b1220);
-                color: var(--text);
-                font-family: Inter, Segoe UI, system-ui, Arial, sans-serif;
+                padding: 0;
             }}
+            
+            body {{
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+                color: var(--text-primary);
+                min-height: 100vh;
+                padding: 2rem;
+            }}
+            
+            .container {{
+                max-width: 1400px;
+                margin: 0 auto;
+            }}
+            
+            header {{
+                margin-bottom: 2rem;
+            }}
+            
             h1 {{
-                margin: 0 0 8px 0;
-                font-size: 28px;
+                font-size: 2rem;
                 font-weight: 700;
-                letter-spacing: 0.2px;
+                margin-bottom: 0.5rem;
+                background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
             }}
+            
             .subtitle {{
-                color: var(--muted);
-                margin-bottom: 22px;
+                color: var(--text-secondary);
+                font-size: 0.95rem;
             }}
-            .grid {{
+            
+            .dashboard-grid {{
                 display: grid;
+                gap: 1.5rem;
                 grid-template-columns: 1fr;
-                gap: 16px;
             }}
-            @media (min-width: 1100px) {{
-                .grid {{
-                    grid-template-columns: 360px 1fr;
+            
+            @media (min-width: 1024px) {{
+                .dashboard-grid {{
+                    grid-template-columns: 380px 1fr;
                 }}
             }}
+            
             .card {{
-                background: rgba(17, 24, 39, 0.75);
-                border: 1px solid #1f2937;
-                border-radius: 12px;
-                backdrop-filter: blur(6px);
-                padding: 16px;
+                background: var(--bg-card);
+                border: 1px solid var(--border);
+                border-radius: 16px;
+                padding: 1.5rem;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
             }}
-            .stat {{
+            
+            .card-title {{
+                font-size: 1.1rem;
+                font-weight: 600;
+                margin-bottom: 1rem;
+                color: var(--text-primary);
+            }}
+            
+            /* Stats Grid */
+            .stats-grid {{
                 display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 10px;
-                margin-bottom: 12px;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 0.75rem;
+                margin-bottom: 1.5rem;
             }}
-            .stat .item {{
-                background: #0b1627;
-                border: 1px solid #1f2937;
-                border-radius: 10px;
-                padding: 12px;
+            
+            .stat-card {{
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 1rem;
             }}
-            .label {{ color: var(--muted); font-size: 12px; }}
-            .value {{ font-size: 20px; font-weight: 700; }}
+            
+            .stat-label {{
+                font-size: 0.75rem;
+                color: var(--text-secondary);
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                margin-bottom: 0.5rem;
+            }}
+            
+            .stat-value {{
+                font-size: 1.75rem;
+                font-weight: 700;
+                color: var(--accent);
+            }}
+            
+            /* Controls */
             .controls {{
                 display: grid;
-                grid-template-columns: 1fr 1fr 1fr;
-                gap: 10px;
-                margin-bottom: 12px;
+                grid-template-columns: 1fr;
+                gap: 0.75rem;
+                margin-bottom: 1.5rem;
             }}
+            
+            @media (min-width: 640px) {{
+                .controls {{
+                    grid-template-columns: repeat(2, 1fr);
+                }}
+            }}
+            
             input, select {{
                 width: 100%;
-                padding: 8px 12px;
-                font-size: 6px;
+                padding: 0.65rem 1rem;
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
                 border-radius: 8px;
-                border: 1px solid #374151;
-                background: #0b1627;
-                color: var(--text);
+                color: var(--text-primary);
+                font-size: 0.9rem;
+                transition: all 0.2s;
+            }}
+            
+            input:focus, select:focus {{
                 outline: none;
+                border-color: var(--accent);
+                box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
             }}
-            input::placeholder {{ color: #6b7280; }}
+            
+            input::placeholder {{
+                color: var(--text-secondary);
+            }}
+            
+            .button-group {{
+                display: grid;
+                grid-template-columns: repeat(2, 1fr);
+                gap: 0.75rem;
+            }}
+            
             button {{
-                padding: 8px 12px;
+                padding: 0.65rem 1.25rem;
+                border: none;
                 border-radius: 8px;
-                border: 1px solid #374151;
-                background: #0b1627;
-                color: var(--text);
+                font-size: 0.9rem;
+                font-weight: 600;
                 cursor: pointer;
+                transition: all 0.2s;
+                background: var(--bg-secondary);
+                color: var(--text-primary);
             }}
+            
+            button:hover {{
+                transform: translateY(-1px);
+            }}
+            
             button.primary {{
-                background: #1d4ed8;
-                border-color: #1d4ed8;
-            }}
-            button.delete-btn {{
-                background: var(--red);
-                border-color: var(--red);
+                background: var(--accent);
                 color: white;
-                font-size: 12px;
-                padding: 6px 12px;
             }}
-            button.delete-btn:hover {{
-                background: #dc2626;
+            
+            button.primary:hover {{
+                background: var(--accent-hover);
             }}
+            
+            button.danger {{
+                background: var(--danger);
+                color: white;
+                padding: 0.5rem 0.75rem;
+                font-size: 0.85rem;
+            }}
+            
+            button.danger:hover {{
+                background: var(--danger-hover);
+            }}
+            
+            /* Table */
+            .table-container {{
+                overflow-x: auto;
+                border-radius: 12px;
+                border: 1px solid var(--border);
+            }}
+            
             table {{
                 width: 100%;
                 border-collapse: collapse;
-                margin-top: 8px;
             }}
+            
             th, td {{
-                padding: 10px;
-                border-bottom: 1px solid #1f2937;
+                padding: 1rem;
                 text-align: left;
-                font-size: 14px;
+                border-bottom: 1px solid var(--border);
             }}
+            
             th {{
-                color: var(--muted);
+                background: var(--bg-secondary);
                 font-weight: 600;
+                font-size: 0.85rem;
+                text-transform: uppercase;
+                letter-spacing: 0.5px;
+                color: var(--text-secondary);
             }}
-            tr:hover td {{
-                background: rgba(29, 78, 216, 0.08);
-                transition: background 150ms;
+            
+            tr:last-child td {{
+                border-bottom: none;
             }}
-            .pill {{
+            
+            tbody tr:hover {{
+                background: rgba(59, 130, 246, 0.05);
+            }}
+            
+            .badge {{
                 display: inline-block;
-                padding: 2px 8px;
+                padding: 0.25rem 0.75rem;
                 border-radius: 999px;
-                font-size: 12px;
-                border: 1px solid #374151;
-                color: var(--muted);
-                background: #0b1627;
+                font-size: 0.8rem;
+                font-weight: 500;
+                background: var(--bg-secondary);
+                border: 1px solid var(--border);
             }}
-            .link-btn {{
-                text-decoration: none;
+            
+            .video-link {{
+                display: inline-block;
+                padding: 0.4rem 0.9rem;
+                background: var(--success);
                 color: white;
-                background-color: #10b981;
-                padding: 6px 10px;
+                text-decoration: none;
                 border-radius: 6px;
+                font-size: 0.85rem;
+                font-weight: 600;
+                transition: all 0.2s;
             }}
-            .link-btn:hover {{
-                background-color: #059669;
+            
+            .video-link:hover {{
+                background: var(--success-hover);
+                transform: translateY(-1px);
             }}
-            .empty {{
-                padding: 18px;
-                color: var(--muted);
+            
+            .empty-state {{
                 text-align: center;
+                padding: 3rem 1rem;
+                color: var(--text-secondary);
             }}
-            .footer {{
-                color: var(--muted);
+            
+            .chart-container {{
+                margin-top: 1rem;
+                height: 200px;
+            }}
+            
+            footer {{
                 text-align: center;
-                margin-top: 16px;
-                font-size: 12px;
+                margin-top: 2rem;
+                padding-top: 1rem;
+                border-top: 1px solid var(--border);
+                color: var(--text-secondary);
+                font-size: 0.85rem;
             }}
         </style>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
     </head>
     <body>
-        <h1>EmoGo Admin Dashboard</h1>
-        <div class="subtitle">Explore records, filter by mood and date, and view summary statistics.</div>
+        <div class="container">
+            <header>
+                <h1>🎭 EmoGo Dashboard</h1>
+                <p class="subtitle">Manage emotion records, analyze patterns, and track mood trends</p>
+            </header>
 
-        <div class="grid">
-            <div class="card">
-                <div class="controls">
-                    <input id="searchNote" type="text" placeholder="Search note text…" />
-                    <select id="moodFilter">
-                        <option value="">All moods</option>
-                    </select>
-                    <input id="dateFrom" type="date" />
-                </div>
-                <div class="controls">
-                    <input id="dateTo" type="date" />
-                    <button id="resetBtn">Reset</button>
-                    <button id="refreshBtn" class="primary">Refresh</button>
+            <div class="dashboard-grid">
+                <!-- Sidebar: Stats & Controls -->
+                <div>
+                    <div class="card">
+                        <h2 class="card-title">📊 Statistics</h2>
+                        <div class="stats-grid">
+                            <div class="stat-card">
+                                <div class="stat-label">Total Records</div>
+                                <div id="statTotal" class="stat-value">0</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">With Videos</div>
+                                <div id="statWithVid" class="stat-value">0</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">Unique Moods</div>
+                                <div id="statMoods" class="stat-value">0</div>
+                            </div>
+                            <div class="stat-card">
+                                <div class="stat-label">Latest Entry</div>
+                                <div id="statLatest" class="stat-value" style="font-size: 0.9rem;">—</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card" style="margin-top: 1.5rem;">
+                        <h2 class="card-title">🔍 Filters</h2>
+                        <div class="controls">
+                            <input id="searchNote" type="text" placeholder="Search notes...">
+                            <select id="moodFilter">
+                                <option value="">All moods</option>
+                            </select>
+                            <input id="dateFrom" type="date" placeholder="From date">
+                            <input id="dateTo" type="date" placeholder="To date">
+                        </div>
+                        <div class="button-group">
+                            <button id="resetBtn">Reset</button>
+                            <button id="refreshBtn" class="primary">Refresh</button>
+                        </div>
+                    </div>
+
+                    <div class="card" style="margin-top: 1.5rem;">
+                        <h2 class="card-title">📈 Mood Distribution</h2>
+                        <div class="chart-container">
+                            <canvas id="moodChart"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="card" style="margin-top: 1.5rem;">
+                        <h2 class="card-title">📅 Timeline</h2>
+                        <div class="chart-container">
+                            <canvas id="timelineChart"></canvas>
+                        </div>
+                    </div>
                 </div>
 
-                <div class="stat">
-                    <div class="item">
-                        <div class="label">Total Records</div>
-                        <div id="statTotal" class="value">0</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">With Videos</div>
-                        <div id="statWithVid" class="value">0</div>
+                <!-- Main: Data Table -->
+                <div class="card">
+                    <h2 class="card-title">📋 Records</h2>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Mood</th>
+                                    <th>Location</th>
+                                    <th>Note</th>
+                                    <th>Video</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="tableBody">
+                                <tr><td colspan="6" class="empty-state">Loading records...</td></tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
-                <div class="stat">
-                    <div class="item">
-                        <div class="label">Unique Moods</div>
-                        <div id="statMoods" class="value">0</div>
-                    </div>
-                    <div class="item">
-                        <div class="label">Latest Timestamp</div>
-                        <div id="statLatest" class="value">—</div>
-                    </div>
-                </div>
-
-                <canvas id="moodChart" height="160"></canvas>
-                <div style="height: 16px"></div>
-                <canvas id="timelineChart" height="160"></canvas>
             </div>
 
-            <div class="card">
-                <table id="dataTable">
-                    <thead>
-                        <tr>
-                            <th>Timestamp</th>
-                            <th>Mood</th>
-                            <th>Location</th>
-                            <th>Note</th>
-                            <th>Vlog</th>
-                            <th>Action</th> </tr>
-                    </thead>
-                    <tbody id="tableBody">
-                        <tr><td colspan="6" class="empty">Loading…</td></tr>
-                    </tbody>
-                </table>
-            </div>
+            <footer>
+                Powered by EmoGo Backend v2.0 • Static files: {base_url}/videos
+            </footer>
         </div>
 
-        <div class="footer">Static files served from {base}/videos. Full URLs in vlog_file are used directly.</div>
-
         <script>
-            const base = "{base}";
-            let all = [];
-            let filtered = [];
+            const BASE_URL = "{base_url}";
+            let allRecords = [];
+            let filteredRecords = [];
             let moodChart, timelineChart;
 
-            const els = {{
+            const elements = {{
                 tableBody: document.getElementById("tableBody"),
                 moodFilter: document.getElementById("moodFilter"),
                 searchNote: document.getElementById("searchNote"),
@@ -310,214 +642,276 @@ async def export_dashboard(request: Request):
                 statLatest: document.getElementById("statLatest"),
             }};
 
-            function fullVideoHref(file) {{
+            // Utility Functions
+            function getVideoUrl(file) {{
                 if (!file) return "";
-                return (file.startsWith("http")) ? file : `${{base}}/videos/${{file}}`;
+                return file.startsWith("http") ? file : `${{BASE_URL}}/videos/${{file}}`;
             }}
 
-            function parseDate(s) {{
-                const d = new Date(s);
-                return isNaN(d.getTime()) ? null : d;
+            function parseDate(dateStr) {{
+                const date = new Date(dateStr);
+                return isNaN(date.getTime()) ? null : date;
             }}
 
-            // --- NEW: DELETE FUNCTION ---
+            function formatDate(date) {{
+                if (!date) return "—";
+                return new Intl.DateTimeFormat('en-US', {{
+                    month: 'short',
+                    day: 'numeric',
+                    hour: '2-digit',
+                    minute: '2-digit'
+                }}).format(date);
+            }}
+
+            // Delete Record
             async function deleteRecord(id) {{
-                if (!confirm("Are you sure you want to delete this record?")) return;
+                if (!confirm("Delete this record permanently?")) return;
+                
                 try {{
-                    const res = await fetch(`${{base}}/record/${{id}}`, {{ method: "DELETE" }});
-                    if (res.ok) {{
-                        // Refresh data after successful delete
-                        fetchData();
+                    const response = await fetch(`${{BASE_URL}}/record/${{id}}`, {{
+                        method: "DELETE"
+                    }});
+                    
+                    if (response.ok) {{
+                        await fetchRecords();
                     }} else {{
-                        alert("Failed to delete record.");
+                        alert("Failed to delete record");
                     }}
-                }} catch (err) {{
-                    console.error(err);
-                    alert("Error deleting record.");
+                }} catch (error) {{
+                    console.error("Delete error:", error);
+                    alert("Error deleting record");
                 }}
             }}
 
-            function fetchData() {{
-                return fetch(`${{base}}/records`).then(r => r.json()).then(data => {{
-                    all = Array.isArray(data.records) ? data.records : [];
-                    initMoodOptions(all);
+            // Fetch Records
+            async function fetchRecords() {{
+                try {{
+                    const response = await fetch(`${{BASE_URL}}/records?limit=1000`);
+                    const data = await response.json();
+                    allRecords = data.records || [];
+                    initializeMoodOptions();
                     applyFilters();
-                }}).catch(err => {{
-                    els.tableBody.innerHTML = `<tr><td colspan="6" class="empty">Failed to load: ${{err}}</td></tr>`;
-                }});
+                }} catch (error) {{
+                    console.error("Fetch error:", error);
+                    elements.tableBody.innerHTML = `
+                        <tr><td colspan="6" class="empty-state">
+                            Failed to load records. Please try again.
+                        </td></tr>
+                    `;
+                }}
             }}
 
-            function initMoodOptions(items) {{
-                const moods = Array.from(new Set(items.map(r => r.mood).filter(Boolean))).sort();
-                els.moodFilter.innerHTML = `<option value="">All moods</option>` + moods.map(m => `<option value="${{m}}">${{m}}</option>`).join("");
+            // Initialize Mood Filter
+            function initializeMoodOptions() {{
+                const moods = [...new Set(allRecords.map(r => r.mood).filter(Boolean))].sort();
+                elements.moodFilter.innerHTML = 
+                    '<option value="">All moods</option>' +
+                    moods.map(m => `<option value="${{m}}">${{m}}</option>`).join('');
             }}
 
+            // Apply Filters
             function applyFilters() {{
-                const q = (els.searchNote.value || "").toLowerCase();
-                const mood = els.moodFilter.value || "";
-                const from = parseDate(els.dateFrom.value);
-                const to = parseDate(els.dateTo.value);
-                filtered = all.filter(r => {{
-                    const note = (r.note || "").toLowerCase();
-                    const okNote = q ? note.includes(q) : true;
-                    const okMood = mood ? r.mood === mood : true;
-                    const d = parseDate(r.timestamp);
-                    const okFrom = from ? (d && d >= from) : true;
-                    const okTo = to ? (d && d <= to) : true;
-                    return okNote && okMood && okFrom && okTo;
+                const searchTerm = elements.searchNote.value.toLowerCase();
+                const selectedMood = elements.moodFilter.value;
+                const fromDate = parseDate(elements.dateFrom.value);
+                const toDate = parseDate(elements.dateTo.value);
+
+                filteredRecords = allRecords.filter(record => {{
+                    const note = (record.note || "").toLowerCase();
+                    const matchesSearch = !searchTerm || note.includes(searchTerm);
+                    const matchesMood = !selectedMood || record.mood === selectedMood;
+                    
+                    const recordDate = parseDate(record.timestamp);
+                    const matchesFrom = !fromDate || (recordDate && recordDate >= fromDate);
+                    const matchesTo = !toDate || (recordDate && recordDate <= toDate);
+
+                    return matchesSearch && matchesMood && matchesFrom && matchesTo;
                 }});
-                renderTable(filtered);
-                renderStats(filtered);
-                renderCharts(filtered);
+
+                renderTable();
+                updateStatistics();
+                renderCharts();
             }}
 
-            function renderTable(items) {{
-                if (!items.length) {{
-                    els.tableBody.innerHTML = `<tr><td colspan="6" class="empty">No records found</td></tr>`;
+            // Render Table
+            function renderTable() {{
+                if (filteredRecords.length === 0) {{
+                    elements.tableBody.innerHTML = `
+                        <tr><td colspan="6" class="empty-state">
+                            No records match your filters
+                        </td></tr>
+                    `;
                     return;
                 }}
-                els.tableBody.innerHTML = items.map(r => {{
-                    const href = fullVideoHref(r.vlog_file);
-                    const loc = [r.latitude, r.longitude].filter(v => v !== undefined && v !== null).join(", ");
-                    const link = href ? `<a class="link-btn" href="${{href}}" target="_blank">Open</a>` : `<span class="pill">No video</span>`;
+
+                elements.tableBody.innerHTML = filteredRecords.map(record => {{
+                    const videoUrl = getVideoUrl(record.vlog_file);
+                    const location = [record.latitude, record.longitude]
+                        .filter(v => v != null)
+                        .join(", ");
                     
-                    // Added Delete Button Column
+                    const videoCell = videoUrl 
+                        ? `<a href="${{videoUrl}}" target="_blank" class="video-link">▶ Watch</a>`
+                        : '<span class="badge">No video</span>';
+
                     return `
                         <tr>
-                            <td>${{r.timestamp || "—"}}</td>
-                            <td><span class="pill">${{r.mood || "—"}}</span></td>
-                            <td>${{loc || "—"}}</td>
-                            <td>${{r.note || ""}}</td>
-                            <td>${{link}}</td>
+                            <td>${{formatDate(parseDate(record.timestamp))}}</td>
+                            <td><span class="badge">${{record.mood || "—"}}</span></td>
+                            <td>${{location || "—"}}</td>
+                            <td style="max-width: 200px; overflow: hidden; text-overflow: ellipsis;">
+                                ${{record.note || ""}}
+                            </td>
+                            <td>${{videoCell}}</td>
                             <td>
-                                <button class="delete-btn" onclick="deleteRecord('${{r._id}}')">Delete</button>
+                                <button class="danger" onclick="deleteRecord('${{record._id}}')">
+                                    🗑️ Delete
+                                </button>
                             </td>
                         </tr>
                     `;
-                }}).join("");
+                }}).join('');
             }}
 
-            function renderStats(items) {{
-                els.statTotal.textContent = items.length;
-                const withVid = items.filter(r => !!r.vlog_file).length;
-                els.statWithVid.textContent = withVid;
-                const uniqueMoods = new Set(items.map(r => r.mood).filter(Boolean));
-                els.statMoods.textContent = uniqueMoods.size;
-                const latest = items
+            // Update Statistics
+            function updateStatistics() {{
+                elements.statTotal.textContent = filteredRecords.length;
+                
+                const withVideo = filteredRecords.filter(r => r.vlog_file).length;
+                elements.statWithVid.textContent = withVideo;
+                
+                const uniqueMoods = new Set(filteredRecords.map(r => r.mood).filter(Boolean));
+                elements.statMoods.textContent = uniqueMoods.size;
+                
+                const latestDate = filteredRecords
                     .map(r => parseDate(r.timestamp))
                     .filter(Boolean)
                     .sort((a, b) => b - a)[0];
-                els.statLatest.textContent = latest ? latest.toISOString() : "—";
+                
+                elements.statLatest.textContent = formatDate(latestDate);
             }}
 
-            function renderCharts(items) {{
-                const counts = items.reduce((acc, r) => {{
+            // Render Charts
+            function renderCharts() {{
+                // Mood Distribution
+                const moodCounts = filteredRecords.reduce((acc, r) => {{
                     if (r.mood) acc[r.mood] = (acc[r.mood] || 0) + 1;
                     return acc;
                 }}, {{}});
-                const labels = Object.keys(counts);
-                const values = labels.map(k => counts[k]);
+                
+                const moodLabels = Object.keys(moodCounts);
+                const moodData = moodLabels.map(k => moodCounts[k]);
 
                 if (moodChart) moodChart.destroy();
                 moodChart = new Chart(document.getElementById("moodChart"), {{
-                    type: "bar",
+                    type: "doughnut",
                     data: {{
-                        labels,
+                        labels: moodLabels,
                         datasets: [{{
-                            label: "Mood frequency",
-                            data: values,
-                            backgroundColor: labels.map(() => "rgba(96,165,250,0.5)"),
-                            borderColor: labels.map(() => "#60a5fa"),
-                            borderWidth: 1
+                            data: moodData,
+                            backgroundColor: [
+                                '#3b82f6', '#8b5cf6', '#ec4899', '#f59e0b', 
+                                '#10b981', '#06b6d4', '#ef4444'
+                            ],
                         }}]
                     }},
                     options: {{
-                        plugins: {{ legend: {{ display: false }} }},
-                        scales: {{
-                            x: {{ ticks: {{ color: "#cbd5e1" }} }},
-                            y: {{ ticks: {{ color: "#cbd5e1" }}, beginAtZero: true }}
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {{
+                            legend: {{
+                                position: 'bottom',
+                                labels: {{ color: '#94a3b8', font: {{ size: 11 }} }}
+                            }}
                         }}
                     }}
                 }});
 
-                const byDay = items.reduce((acc, r) => {{
-                    const d = parseDate(r.timestamp);
-                    if (!d) return acc;
-                    const key = d.toISOString().slice(0, 10);
+                // Timeline Chart
+                const byDay = filteredRecords.reduce((acc, r) => {{
+                    const date = parseDate(r.timestamp);
+                    if (!date) return acc;
+                    const key = date.toISOString().split('T')[0];
                     acc[key] = (acc[key] || 0) + 1;
                     return acc;
                 }}, {{}});
-                const tLabels = Object.keys(byDay).sort();
-                const tValues = tLabels.map(k => byDay[k]);
+                
+                const timelineLabels = Object.keys(byDay).sort();
+                const timelineData = timelineLabels.map(k => byDay[k]);
 
                 if (timelineChart) timelineChart.destroy();
                 timelineChart = new Chart(document.getElementById("timelineChart"), {{
                     type: "line",
                     data: {{
-                        labels: tLabels,
+                        labels: timelineLabels,
                         datasets: [{{
-                            label: "Records per day",
-                            data: tValues,
-                            fill: false,
-                            borderColor: "#22c55e",
-                            tension: 0.3
+                            label: "Records",
+                            data: timelineData,
+                            borderColor: '#10b981',
+                            backgroundColor: 'rgba(16, 185, 129, 0.1)',
+                            fill: true,
+                            tension: 0.4
                         }}]
                     }},
                     options: {{
-                        plugins: {{ legend: {{ display: false }} }},
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: {{
+                            legend: {{ display: false }}
+                        }},
                         scales: {{
-                            x: {{ ticks: {{ color: "#cbd5e1" }} }},
-                            y: {{ ticks: {{ color: "#cbd5e1" }}, beginAtZero: true }}
+                            x: {{ ticks: {{ color: '#64748b', maxRotation: 45 }} }},
+                            y: {{ 
+                                ticks: {{ color: '#64748b' }}, 
+                                beginAtZero: true 
+                            }}
                         }}
                     }}
                 }});
             }}
 
-            ["input", "change"].forEach(evt => {{
-                els.searchNote.addEventListener(evt, applyFilters);
-                els.moodFilter.addEventListener(evt, applyFilters);
-                els.dateFrom.addEventListener(evt, applyFilters);
-                els.dateTo.addEventListener(evt, applyFilters);
+            // Event Listeners
+            ["input", "change"].forEach(event => {{
+                elements.searchNote.addEventListener(event, applyFilters);
+                elements.moodFilter.addEventListener(event, applyFilters);
+                elements.dateFrom.addEventListener(event, applyFilters);
+                elements.dateTo.addEventListener(event, applyFilters);
             }});
-            els.resetBtn.addEventListener("click", () => {{
-                els.searchNote.value = "";
-                els.moodFilter.value = "";
-                els.dateFrom.value = "";
-                els.dateTo.value = "";
+
+            elements.resetBtn.addEventListener("click", () => {{
+                elements.searchNote.value = "";
+                elements.moodFilter.value = "";
+                elements.dateFrom.value = "";
+                elements.dateTo.value = "";
                 applyFilters();
             }});
-            els.refreshBtn.addEventListener("click", fetchData);
 
-            fetchData();
+            elements.refreshBtn.addEventListener("click", fetchRecords);
+
+            // Initialize
+            fetchRecords();
         </script>
     </body>
     </html>
     """
-    return html_content
+    
+    return HTMLResponse(content=html_content)
 
-# ==========================
-#     CLEANUP UTILITIES
-# ==========================
+# ==================== ERROR HANDLERS ====================
 
-@app.delete("/record/{record_id}")
-async def delete_record(record_id: str):
-    # Validate ObjectId
-    if not ObjectId.is_valid(record_id):
-        raise HTTPException(status_code=400, detail="Invalid record_id")
-    result = await collection.delete_one({"_id": ObjectId(record_id)})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Record not found")
-    return {"status": "success", "deleted": str(record_id)}
+@app.exception_handler(404)
+async def not_found_handler(request: Request, exc: HTTPException):
+    """Custom 404 handler"""
+    return JSONResponse(
+        status_code=404,
+        content={"error": "Resource not found", "path": str(request.url)}
+    )
 
-@app.delete("/records/cleanup")
-async def cleanup_empty_vlogs():
-    # Delete posts with missing/empty vlog_file
-    query = {
-        "$or": [
-            {"vlog_file": {"$exists": False}},
-            {"vlog_file": None},
-            {"vlog_file": ""},
-        ]
-    }
-    result = await collection.delete_many(query)
-    return {"status": "success", "deleted_count": result.deleted_count}
+@app.exception_handler(500)
+async def server_error_handler(request: Request, exc: Exception):
+    """Custom 500 handler"""
+    logger.error(f"Internal server error: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}
+    )
