@@ -142,7 +142,8 @@ async def export_dashboard(request: Request):
             }}
             input, select {{
                 width: 100%;
-                padding: 12px 18px;
+                padding: 8px 12px;
+                font-size: 6px;
                 border-radius: 8px;
                 border: 1px solid #374151;
                 background: #0b1627;
