@@ -162,6 +162,16 @@ async def export_dashboard(request: Request):
                 background: #1d4ed8;
                 border-color: #1d4ed8;
             }}
+            button.delete-btn {{
+                background: var(--red);
+                border-color: var(--red);
+                color: white;
+                font-size: 12px;
+                padding: 6px 12px;
+            }}
+            button.delete-btn:hover {{
+                background: #dc2626;
+            }}
             table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -268,8 +278,7 @@ async def export_dashboard(request: Request):
                             <th>Location</th>
                             <th>Note</th>
                             <th>Vlog</th>
-                            <th>ID</th>
-                        </tr>
+                            <th>Action</th> </tr>
                     </thead>
                     <tbody id="tableBody">
                         <tr><td colspan="6" class="empty">Loading…</td></tr>
@@ -308,6 +317,23 @@ async def export_dashboard(request: Request):
             function parseDate(s) {{
                 const d = new Date(s);
                 return isNaN(d.getTime()) ? null : d;
+            }}
+
+            // --- NEW: DELETE FUNCTION ---
+            async function deleteRecord(id) {{
+                if (!confirm("Are you sure you want to delete this record?")) return;
+                try {{
+                    const res = await fetch(`${{base}}/record/${{id}}`, {{ method: "DELETE" }});
+                    if (res.ok) {{
+                        // Refresh data after successful delete
+                        fetchData();
+                    }} else {{
+                        alert("Failed to delete record.");
+                    }}
+                }} catch (err) {{
+                    console.error(err);
+                    alert("Error deleting record.");
+                }}
             }}
 
             function fetchData() {{
@@ -353,6 +379,8 @@ async def export_dashboard(request: Request):
                     const href = fullVideoHref(r.vlog_file);
                     const loc = [r.latitude, r.longitude].filter(v => v !== undefined && v !== null).join(", ");
                     const link = href ? `<a class="link-btn" href="${{href}}" target="_blank">Open</a>` : `<span class="pill">No video</span>`;
+                    
+                    // Added Delete Button Column
                     return `
                         <tr>
                             <td>${{r.timestamp || "—"}}</td>
@@ -360,7 +388,9 @@ async def export_dashboard(request: Request):
                             <td>${{loc || "—"}}</td>
                             <td>${{r.note || ""}}</td>
                             <td>${{link}}</td>
-                            <td><span class="pill">${{r._id}}</span></td>
+                            <td>
+                                <button class="delete-btn" onclick="deleteRecord('${{r._id}}')">Delete</button>
+                            </td>
                         </tr>
                     `;
                 }}).join("");
